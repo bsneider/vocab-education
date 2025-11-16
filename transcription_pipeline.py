@@ -21,6 +21,12 @@ from presidio_analyzer import AnalyzerEngine
 from presidio_anonymizer import AnonymizerEngine
 from tqdm import tqdm
 
+# Optional: used to detect platform (CUDA / MPS / CPU)
+try:
+    import torch
+except Exception:
+    torch = None
+
 # ==================== CONFIGURATION ====================
 # Google Drive folder ID (extract from your URL)
 GDRIVE_FOLDER_ID = "1KmmQgwO42YTVLeb9nXON-0iIU4DKmn-G"
@@ -32,12 +38,71 @@ AUDIO_DIR = "./extracted_audio"
 TRANSCRIPT_DIR = "./anonymized_transcripts"
 
 # Whisper Configuration (optimized for children)
-# Research shows large-v2 or large-v3 works best for child speech after fine-tuning
-# For out-of-box use, medium or large-v2 recommended
-WHISPER_MODEL = "large-v2"  # Options: "medium", "large-v2", "large-v3"
-DEVICE = "cuda"  # "cuda" for GPU, "cpu" for CPU
-COMPUTE_TYPE = "float16"  # "float16" for GPU, "int8" for CPU
-BATCH_SIZE = 8  # Reduce if GPU memory issues
+# Model, device and compute-type are auto-selected where possible.
+# You can still override by setting environment variables:
+#  - VOCAB_WHISPER_MODEL (e.g. small|medium|large-v2)
+#  - VOCAB_DEVICE (cuda|mps|cpu)
+#  - VOCAB_COMPUTE_TYPE (float16|int8)
+#  - VOCAB_BATCH_SIZE (integer)
+
+# Start with conservative defaults; we'll detect and overwrite below
+WHISPER_MODEL = os.environ.get("VOCAB_WHISPER_MODEL", None)
+DEVICE = os.environ.get("VOCAB_DEVICE", None)
+COMPUTE_TYPE = os.environ.get("VOCAB_COMPUTE_TYPE", None)
+BATCH_SIZE = int(os.environ.get("VOCAB_BATCH_SIZE", 0))
+
+
+def detect_device_and_defaults():
+    """Detect best available device and sensible defaults for compute type and batch size.
+
+    Priority: CUDA -> MPS (Apple silicon) -> CPU
+    Returns: (device, compute_type, batch_size, default_model)
+    """
+    # Safe conservative defaults
+    device = "cpu"
+    compute_type = "int8"
+    batch_size = 1
+    default_model = "small"
+
+    try:
+        if torch is not None and torch.cuda.is_available():
+            device = "cuda"
+            compute_type = "float16"
+            batch_size = 8
+            default_model = "large-v2"
+        elif torch is not None and getattr(torch.backends, "mps", None) and torch.backends.mps.is_available():
+            device = "mps"
+            # MPS can perform well but has limited memory compared to desktop CUDA GPUs
+            compute_type = "float16"
+            batch_size = 2
+            default_model = "medium"
+        else:
+            device = "cpu"
+            compute_type = "int8"
+            batch_size = 1
+            default_model = "small"
+    except Exception:
+        # Fall back to conservative CPU defaults
+        device = "cpu"
+        compute_type = "int8"
+        batch_size = 1
+        default_model = "small"
+
+    return device, compute_type, batch_size, default_model
+
+
+# Auto-detect and apply defaults if not explicitly set via env
+detected_device, detected_compute_type, detected_batch_size, detected_default_model = detect_device_and_defaults()
+
+if DEVICE is None:
+    DEVICE = detected_device
+if COMPUTE_TYPE is None:
+    COMPUTE_TYPE = detected_compute_type
+if not BATCH_SIZE:
+    BATCH_SIZE = detected_batch_size
+if WHISPER_MODEL is None:
+    # Use a safer default depending on device — allow env var override
+    WHISPER_MODEL = detected_default_model
 
 # Fine-tuning recommendations from research:
 # - Learning rate: 1e-5 for Whisper child speech fine-tuning
