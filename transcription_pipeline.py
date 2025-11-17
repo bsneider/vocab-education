@@ -21,6 +21,7 @@ from presidio_analyzer import AnalyzerEngine
 from presidio_anonymizer import AnonymizerEngine
 from tqdm import tqdm
 from typing import Any, cast
+import traceback
 
 # Optional: used to detect platform (CUDA / MPS / CPU)
 # Use `# type: ignore` so type checkers/Pylance won't error if torch
@@ -275,19 +276,24 @@ def transcribe_and_diarize(audio_files):
                 return_char_alignments=False
             )
 
-            # Diarization (speaker identification)
-            # DiarizationPipeline may not be present in some whisperx stubs; silence
-            # static attribute warnings while preserving runtime behavior.
-            diarize_model = whisperx.DiarizationPipeline(  # type: ignore[attr-defined]
-                use_auth_token=None,  # Set Hugging Face token if needed
-                device=whisper_device
-            )
-            diarize_segments = diarize_model(
-                str(audio_path),
-                min_speakers=MIN_SPEAKERS,
-                max_speakers=MAX_SPEAKERS
-            )
-            result = whisperx.assign_word_speakers(diarize_segments, result)
+            # Optional: allow disabling diarization for speed/compatibility
+            disable_diar = os.environ.get("VOCAB_DISABLE_DIARIZATION", "0") == "1"
+            if disable_diar:
+                print("  • Diarization disabled via VOCAB_DISABLE_DIARIZATION=1; proceeding without speaker labels.")
+            else:
+                # Diarization (speaker identification)
+                # DiarizationPipeline may not be present in some whisperx stubs; silence
+                # static attribute warnings while preserving runtime behavior.
+                diarize_model = whisperx.DiarizationPipeline(  # type: ignore[attr-defined]
+                    use_auth_token=None,  # Set Hugging Face token if needed
+                    device=whisper_device
+                )
+                diarize_segments = diarize_model(
+                    str(audio_path),
+                    min_speakers=MIN_SPEAKERS,
+                    max_speakers=MAX_SPEAKERS
+                )
+                result = whisperx.assign_word_speakers(diarize_segments, result)
 
             # Format transcript with speaker labels
             transcript_text = format_transcript(result["segments"])
@@ -313,7 +319,20 @@ def transcribe_and_diarize(audio_files):
             })
 
         except Exception as e:
+            # Create logs dir
+            os.makedirs("./logs", exist_ok=True)
+            log_file = Path("./logs") / f"transcription_{base_name}.log"
+            tb = traceback.format_exc()
+            try:
+                with open(log_file, "w", encoding="utf-8") as lf:
+                    lf.write("Transcription error for file: " + str(audio_path) + "\n\n")
+                    lf.write(tb)
+            except Exception:
+                # best-effort write; ignore
+                pass
+
             print(f"\n✗ Error transcribing {audio_path}: {e}")
+            print(f"Detailed traceback written to: {log_file}")
             transcripts.append({
                 "file": Path(audio_path).stem,
                 "transcript": "[TRANSCRIPTION FAILED]",
@@ -413,6 +432,14 @@ def main():
 
     # Step 1: Download videos
     video_files = download_videos()
+    # Optionally only process the smallest video for quicker runs
+    if os.environ.get("VOCAB_ONLY_SMALLEST", "0") == "1" and video_files:
+        try:
+            smallest = min(video_files, key=lambda p: os.path.getsize(p))
+            print(f"Processing only the smallest video (VOCAB_ONLY_SMALLEST=1): {smallest}")
+            video_files = [smallest]
+        except Exception as e:
+            print(f"Warning: could not select smallest video: {e}. Proceeding with all videos.")
     if not video_files:
         print("\n✗ No videos downloaded. Exiting.")
         return
