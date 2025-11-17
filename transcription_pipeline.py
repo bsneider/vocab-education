@@ -117,6 +117,7 @@ if WHISPER_MODEL is None:
 # Diarization settings
 MIN_SPEAKERS = 2  # Teacher + Student
 MAX_SPEAKERS = 2
+DIARIZATION_METHOD = os.environ.get("VOCAB_DIARIZATION_METHOD", "auto").lower()
 
 # PII/PHI entities to anonymize
 PII_PHI_ENTITIES = [
@@ -312,124 +313,25 @@ def transcribe_and_diarize(audio_files):
             if disable_diar:
                 print("  • Diarization disabled via VOCAB_DISABLE_DIARIZATION=1; proceeding without speaker labels.")
             else:
-                # Diarization (speaker identification)
-                # Try simple energy-based speaker detection first (no HF token needed)
-                # Then fall back to HF-based models if token is provided
                 hf_token = os.environ.get("VOCAB_HF_TOKEN")
-                
-                if not hf_token:
-                    # Advanced approach: analyze pitch/energy to detect child vs adult
-                    # Children have higher pitch (200-300 Hz) vs adults (85-180 Hz for males, 165-255 Hz for females)
-                    print("  • Using pitch/energy-based speaker detection (no HuggingFace token)")
-                    print("  • Analyzing audio characteristics to separate child from adult voices")
-                    
-                    try:
-                        import numpy as np
-                        import librosa
-                        
-                        # Load audio for detailed analysis
-                        audio_data, sr = librosa.load(str(audio_path), sr=16000)
-                        
-                        # Analyze each segment for pitch characteristics
-                        segment_features = []
-                        for segment in result["segments"]:
-                            start_sample = int(segment.get("start", 0) * sr)
-                            end_sample = int(segment.get("end", start_sample/sr + 1) * sr)
-                            segment_audio = audio_data[start_sample:end_sample]
-                            
-                            if len(segment_audio) > 0:
-                                # Extract pitch using librosa
-                                pitches, magnitudes = librosa.piptrack(
-                                    y=segment_audio, 
-                                    sr=sr,
-                                    fmin=50,  # Min frequency to detect
-                                    fmax=400  # Max frequency (covers child range)
-                                )
-                                
-                                # Get median pitch (more robust than mean)
-                                pitch_values = pitches[magnitudes > np.median(magnitudes)]
-                                median_pitch = np.median(pitch_values) if len(pitch_values) > 0 else 0
-                                
-                                # Calculate energy/loudness
-                                energy = np.mean(librosa.feature.rms(y=segment_audio))
-                                
-                                segment_features.append({
-                                    'pitch': median_pitch,
-                                    'energy': energy,
-                                    'duration': segment.get("end", 0) - segment.get("start", 0)
-                                })
-                            else:
-                                segment_features.append({'pitch': 0, 'energy': 0, 'duration': 0})
-                        
-                        # Cluster segments into 2 groups (adult vs child) using simple k-means on pitch
-                        pitches = np.array([f['pitch'] for f in segment_features])
-                        valid_pitches = pitches[pitches > 0]
-                        
-                        if len(valid_pitches) > 2:
-                            # Simple 2-means: find median, assign based on above/below
-                            pitch_threshold = np.median(valid_pitches)
-                            
-                            # Assign speakers: higher pitch = likely child
-                            for i, (segment, features) in enumerate(zip(result["segments"], segment_features)):
-                                if features['pitch'] > pitch_threshold and features['pitch'] > 0:
-                                    segment["speaker"] = "SPEAKER_01"  # Higher pitch (child)
-                                elif features['pitch'] > 0:
-                                    segment["speaker"] = "SPEAKER_00"  # Lower pitch (adult)
-                                else:
-                                    # Fall back to turn-taking for segments without clear pitch
-                                    if i > 0:
-                                        segment["speaker"] = result["segments"][i-1].get("speaker", "SPEAKER_00")
-                                    else:
-                                        segment["speaker"] = "SPEAKER_00"
-                            
-                            print(f"  • Detected pitch threshold: {pitch_threshold:.1f} Hz")
-                            print(f"  • SPEAKER_00 (adult/lower pitch), SPEAKER_01 (child/higher pitch)")
-                        else:
-                            # Fallback to turn-taking if pitch detection fails
-                            print("  • Insufficient pitch data, using turn-taking fallback")
-                            current_speaker = "SPEAKER_00"
-                            last_end = 0
-                            for segment in result["segments"]:
-                                start = segment.get("start", 0)
-                                if start - last_end > 1.0:
-                                    current_speaker = "SPEAKER_01" if current_speaker == "SPEAKER_00" else "SPEAKER_00"
-                                segment["speaker"] = current_speaker
-                                last_end = segment.get("end", start)
-                        
-                    except Exception as e:
-                        print(f"  • Simple diarization failed: {e}")
-                        print("  • Proceeding without speaker labels")
-                        print("  • Assigned speakers based on turn-taking patterns")
-                        
-                    except Exception as e:
-                        print(f"  • Simple diarization failed: {e}")
-                        print("  • Proceeding without speaker labels")
-                else:
-                    # HuggingFace token provided - use advanced pyannote models
+                assigned = False
+
+                # 1) If method is hf/auto and token available, prefer HF diarization
+                if (DIARIZATION_METHOD in ("auto", "hf")) and hf_token and not assigned:
                     print("  • Using Hugging Face token for diarization.")
-                    
-                    # Create pitch-adjusted version for better child voice detection
-                    # Children's voices are 3-5 semitones higher; shift down for diarization
                     pitch_env = os.environ.get("VOCAB_PITCH_SHIFT", "-4")
                     try:
                         pitch_shift = int(pitch_env)
-                    except:
+                    except Exception:
                         pitch_shift = -4
-                    
-                    if pitch_shift != 0:
-                        print(f"  • Creating pitch-adjusted audio ({pitch_shift:+d} semitones) for better child voice detection")
-                        diarization_audio = create_pitch_adjusted_audio(audio_path, pitch_shift)
-                    else:
-                        diarization_audio = audio_path
-                    
+                    diarization_audio = create_pitch_adjusted_audio(audio_path, pitch_shift) if pitch_shift != 0 else audio_path
+
                     diarize_segments = None
                     try:
-                        # Try whisperx DiarizationPipeline first
                         diarize_model = whisperx.DiarizationPipeline(  # type: ignore[attr-defined]
                             use_auth_token=hf_token,
                             device=whisper_device
                         )
-                        # Allow forcing an exact speaker count via env
                         min_speakers = MIN_SPEAKERS
                         max_speakers = MAX_SPEAKERS
                         force_num_env = os.environ.get("VOCAB_FORCE_NUM_SPEAKERS")
@@ -447,30 +349,23 @@ def transcribe_and_diarize(audio_files):
                             max_speakers=max_speakers
                         )
                     except AttributeError:
-                        # Fallback to pyannote.audio with child-optimized parameters
                         try:
                             from pyannote.audio import Pipeline  # type: ignore
-                            print("  • Using pyannote.audio speaker-diarization-3.1 pipeline (child-optimized)")
+                            print("  • Using pyannote.audio speaker-diarization-3.1 pipeline")
                             pipeline = Pipeline.from_pretrained(
                                 "pyannote/speaker-diarization-3.1",
                                 use_auth_token=hf_token
                             )
-                            
-                            # Child speech optimization parameters
-                            # Lower min_duration_off to catch shorter pauses (children speak faster)
-                            # Adjust clustering threshold for better child/adult separation
                             force_num_env = os.environ.get("VOCAB_FORCE_NUM_SPEAKERS")
                             if force_num_env:
                                 try:
                                     num_speakers = int(force_num_env)
-                                    print(f"  • Forcing diarization to {num_speakers} speaker(s)")
                                     diarize_segments = pipeline(
                                         str(diarization_audio),
                                         num_speakers=num_speakers,
-                                        min_duration_off=0.3  # Shorter pauses for child speech
+                                        min_duration_off=0.3
                                     )
                                 except Exception:
-                                    print(f"  • Falling back to min/max speakers")
                                     diarize_segments = pipeline(
                                         str(diarization_audio),
                                         min_speakers=MIN_SPEAKERS,
@@ -482,29 +377,76 @@ def transcribe_and_diarize(audio_files):
                                     str(diarization_audio),
                                     min_speakers=MIN_SPEAKERS,
                                     max_speakers=MAX_SPEAKERS,
-                                    min_duration_off=0.3  # Child-optimized: shorter pauses
+                                    min_duration_off=0.3
                                 )
                         except Exception as de:
                             print(f"  • Diarization fallback failed: {de}")
-                            print(f"  • Note: Pyannote models may require accepting terms at:")
-                            print(f"  •   https://huggingface.co/pyannote/speaker-diarization-3.1")
-                            print(f"  •   https://huggingface.co/pyannote/segmentation-3.0")
-                    
+                            print("  • Note: You may need to accept model terms on HuggingFace.")
+
                     if diarize_segments is not None:
                         result = whisperx.assign_word_speakers(diarize_segments, result)
                         try:
                             speakers_detected = sorted({seg.get("speaker") for seg in result.get("segments", []) if seg.get("speaker")})
                             if speakers_detected:
                                 print(f"  • Speakers detected: {', '.join(speakers_detected)}")
-                            else:
-                                print(f"  • Warning: No speakers detected. This may indicate:")
-                                print(f"  •   - Model terms not accepted on HuggingFace")
-                                print(f"  •   - Very similar voices (child/adult can be hard to separate)")
-                                print(f"  •   - Audio quality issues")
                         except Exception:
                             pass
-                    else:
-                        print("  • Proceeding without diarization due to previous errors.")
+                        assigned = True
+
+                # 2) If not assigned and method is embeddings/auto, try embedding-based diarization
+                if not assigned and DIARIZATION_METHOD in ("auto", "embeddings"):
+                    ok = diarize_with_embeddings(audio_path, result)
+                    if ok:
+                        print("  • Speakers assigned via ECAPA embeddings + clustering")
+                        assigned = True
+
+                # 3) If still not assigned, fall back to pitch/energy heuristic
+                if not assigned:
+                    print("  • Using pitch/energy-based speaker detection (no HuggingFace token)")
+                    try:
+                        import numpy as np
+                        import librosa
+                        audio_data, sr = librosa.load(str(audio_path), sr=16000)
+                        segment_features = []
+                        for segment in result["segments"]:
+                            start_sample = int(segment.get("start", 0) * sr)
+                            end_sample = int(segment.get("end", start_sample/sr + 1) * sr)
+                            segment_audio = audio_data[start_sample:end_sample]
+                            if len(segment_audio) > 0:
+                                pitches, magnitudes = librosa.piptrack(y=segment_audio, sr=sr, fmin=50, fmax=400)
+                                pitch_values = pitches[magnitudes > np.median(magnitudes)]
+                                median_pitch = np.median(pitch_values) if len(pitch_values) > 0 else 0
+                                energy = np.mean(librosa.feature.rms(y=segment_audio))
+                                segment_features.append({'pitch': median_pitch, 'energy': energy})
+                            else:
+                                segment_features.append({'pitch': 0, 'energy': 0})
+                        pitches_arr = np.array([f['pitch'] for f in segment_features], dtype=float)
+                        valid = pitches_arr[pitches_arr > 0]
+                        if len(valid) > 2:
+                            thr = np.median(valid)
+                            prev_spk = "SPEAKER_00"
+                            for i, (segment, feats) in enumerate(zip(result["segments"], segment_features)):
+                                if feats['pitch'] > thr and feats['pitch'] > 0:
+                                    spk = "SPEAKER_01"
+                                elif feats['pitch'] > 0:
+                                    spk = "SPEAKER_00"
+                                else:
+                                    spk = prev_spk
+                                segment["speaker"] = spk
+                                prev_spk = spk
+                            print(f"  • Detected pitch threshold: {thr:.1f} Hz")
+                        else:
+                            current_speaker = "SPEAKER_00"
+                            last_end = 0
+                            for segment in result["segments"]:
+                                start = segment.get("start", 0)
+                                if start - last_end > 1.0:
+                                    current_speaker = "SPEAKER_01" if current_speaker == "SPEAKER_00" else "SPEAKER_00"
+                                segment["speaker"] = current_speaker
+                                last_end = segment.get("end", start)
+                    except Exception as e:
+                        print(f"  • Heuristic diarization failed: {e}")
+                        print("  • Proceeding without speaker labels")
 
             # Format transcript with speaker labels
             transcript_text = format_transcript(result["segments"])
@@ -552,6 +494,168 @@ def transcribe_and_diarize(audio_files):
 
     print(f"\n✓ Transcribed {len(transcripts)} audio files")
     return transcripts
+
+def diarize_with_embeddings(audio_path, result):
+    """Tokenless diarization using ECAPA-TDNN speaker embeddings and clustering.
+    Returns True if speakers were assigned, False otherwise.
+    """
+    try:
+        from speechbrain.pretrained import EncoderClassifier  # type: ignore
+        import numpy as np
+        import librosa
+        from sklearn.cluster import AgglomerativeClustering  # type: ignore
+        import numpy.linalg as LA
+
+        sr = 16000
+        y, _ = librosa.load(str(audio_path), sr=sr)
+
+        # Tunables via env
+        try:
+            win = float(os.environ.get("VOCAB_EMB_WIN_SEC", "1.5"))
+            hop = float(os.environ.get("VOCAB_EMB_HOP_SEC", "0.75"))
+            min_rms = float(os.environ.get("VOCAB_EMB_MIN_RMS", "0.005"))
+            emb_pitch_shift = int(os.environ.get("VOCAB_EMB_PITCH_SHIFT", "0"))
+        except Exception:
+            win, hop, min_rms, emb_pitch_shift = 1.5, 0.75, 0.005, 0
+
+        # Simple pre-emphasis to boost higher formants (helps child voice timbre)
+        if y.size >= 2:
+            y_pre = np.append(y[0], y[1:] - 0.97 * y[:-1])
+        else:
+            y_pre = y
+
+        # Build analysis windows within each ASR segment
+        windows = []
+        for seg in result.get("segments", []):
+            s = float(seg.get("start", 0.0))
+            e = float(seg.get("end", s))
+            t = s
+            while t + 0.5 < e:  # minimum 0.5s
+                w_start = t
+                w_end = min(t + win, e)
+                windows.append((w_start, w_end))
+                t += hop
+
+        if not windows:
+            return False
+
+        # Load embedding model (CPU for broad compatibility)
+        run_device = "cuda" if (torch is not None and getattr(torch, "cuda", None) and torch.cuda.is_available()) else "cpu"  # type: ignore
+        encoder = EncoderClassifier.from_hparams(source="speechbrain/spkrec-ecapa-voxceleb", run_opts={"device": run_device})
+
+        embs = []
+        win_pitches = []
+        for (ws, we) in windows:
+            s_idx = int(ws * sr)
+            e_idx = int(we * sr)
+            wav = y[s_idx:e_idx]
+            if wav.size < int(0.5 * sr):
+                continue
+            # Voice activity gating
+            rms = float(np.mean(librosa.feature.rms(y=wav))) if wav.size else 0.0
+            if rms < min_rms:
+                continue
+
+            # Estimate pitch on original window (no pitch shift)
+            try:
+                f0 = librosa.yin(wav, fmin=50, fmax=400, sr=sr)
+                f0 = float(np.nanmedian(f0)) if np.isfinite(f0).any() else 0.0
+            except Exception:
+                f0 = 0.0
+            win_pitches.append(f0)
+
+            # Pre-emphasis (and optional pitch-shift) for embedding extraction
+            if e_idx - s_idx >= 2:
+                seg_pre = np.append(wav[0], wav[1:] - 0.97 * wav[:-1])
+            else:
+                seg_pre = wav
+            if emb_pitch_shift != 0:
+                try:
+                    seg_for_emb = librosa.effects.pitch_shift(seg_pre, sr=sr, n_steps=emb_pitch_shift)
+                except Exception:
+                    seg_for_emb = seg_pre
+            else:
+                seg_for_emb = seg_pre
+
+            wav = np.expand_dims(seg_for_emb, 0)
+            import torch as _torch  # local import to avoid type issues
+            tensor = _torch.from_numpy(wav).float()
+            with _torch.no_grad():
+                emb = encoder.encode_batch(tensor).squeeze(0).squeeze(0).cpu().numpy()
+            # L2 normalize
+            emb = emb / (LA.norm(emb) + 1e-8)
+            embs.append(emb)
+
+        if len(embs) < 2:
+            return False
+
+        X = np.vstack(embs)
+        # Cluster into two speakers using cosine distance
+        clustering = AgglomerativeClustering(n_clusters=2, metric='cosine', linkage='average')
+        labels = clustering.fit_predict(X)
+
+        # Determine which cluster corresponds to higher pitch (child)
+        child_cluster = 1
+        try:
+            lp = np.array(win_pitches, dtype=float)
+            lbls = np.array(labels, dtype=int)
+            c0 = np.nanmedian(lp[lbls == 0]) if np.any(lbls == 0) else np.nan
+            c1 = np.nanmedian(lp[lbls == 1]) if np.any(lbls == 1) else np.nan
+            if np.isfinite(c0) and np.isfinite(c1):
+                child_cluster = 0 if c0 > c1 else 1
+        except Exception:
+            pass
+
+        # Assign speaker label to each original segment by majority vote of overlapping windows
+        # Build mapping from window to time
+        seg_labels = []
+        win_idx = 0
+        for seg in result.get("segments", []):
+            s = float(seg.get("start", 0.0))
+            e = float(seg.get("end", s))
+            counts = {0: 0.0, 1: 0.0}
+            w_cursor = 0.0
+            # Iterate all windows and tally overlap
+            for i, (ws, we) in enumerate(windows):
+                ov = max(0.0, min(e, we) - max(s, ws))
+                if ov > 0:
+                    lbl = int(labels[i])
+                    counts[lbl] += ov
+            # Choose label with higher overlap
+            if counts[0] == 0 and counts[1] == 0:
+                seg_labels.append(None)
+            else:
+                seg_labels.append(0 if counts[0] >= counts[1] else 1)
+
+        # Simple smoothing to avoid rapid flips: majority over triplets
+        smoothed = []
+        prev = 0
+        for i, lbl in enumerate(seg_labels):
+            if lbl is None:
+                smoothed.append(prev)
+                continue
+            a = seg_labels[i-1] if i-1 >= 0 and seg_labels[i-1] is not None else lbl
+            b = lbl
+            c = seg_labels[i+1] if i+1 < len(seg_labels) and seg_labels[i+1] is not None else lbl
+            vote0 = (a == 0) + (b == 0) + (c == 0)
+            vote1 = 3 - vote0
+            final_lbl = 0 if vote0 >= vote1 else 1
+            smoothed.append(final_lbl)
+            prev = final_lbl
+
+        for seg, lbl in zip(result.get("segments", []), smoothed):
+            # Map cluster with higher median pitch to SPEAKER_01 (child)
+            mapped = int(lbl)
+            if child_cluster == 0:
+                seg["speaker"] = "SPEAKER_01" if mapped == 0 else "SPEAKER_00"
+            else:
+                seg["speaker"] = "SPEAKER_01" if mapped == 1 else "SPEAKER_00"
+
+        return True
+    except Exception as e:
+        print(f"  • Embedding-based diarization unavailable or failed: {e}")
+        print("  • Hint: pip install 'speechbrain' 'scikit-learn' 'librosa'")
+        return False
 
 def format_transcript(segments):
     """Format segments into readable transcript with speaker labels"""
