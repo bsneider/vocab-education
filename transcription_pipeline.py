@@ -318,36 +318,83 @@ def transcribe_and_diarize(audio_files):
                 hf_token = os.environ.get("VOCAB_HF_TOKEN")
                 
                 if not hf_token:
-                    # Simple approach: use energy/amplitude to detect speakers
-                    # Adult voices typically have lower pitch and different energy patterns
-                    print("  • Using simple energy-based speaker detection (no HuggingFace token)")
-                    print("  • Note: For better accuracy, set VOCAB_HF_TOKEN with pyannote models")
+                    # Advanced approach: analyze pitch/energy to detect child vs adult
+                    # Children have higher pitch (200-300 Hz) vs adults (85-180 Hz for males, 165-255 Hz for females)
+                    print("  • Using pitch/energy-based speaker detection (no HuggingFace token)")
+                    print("  • Analyzing audio characteristics to separate child from adult voices")
                     
                     try:
-                        # Use whisperx's built-in VAD and assign speakers based on segment patterns
-                        # This won't be perfect but provides basic teacher/student separation
                         import numpy as np
-                        from scipy import signal
+                        import librosa
                         
-                        # Load audio for analysis
-                        audio_data = whisperx.load_audio(str(audio_path))
+                        # Load audio for detailed analysis
+                        audio_data, sr = librosa.load(str(audio_path), sr=16000)
                         
-                        # Simple heuristic: alternate speakers on longer pauses
-                        # Assign SPEAKER_00 and SPEAKER_01 based on turn-taking patterns
-                        current_speaker = "SPEAKER_00"
-                        last_end = 0
-                        
-                        for i, segment in enumerate(result["segments"]):
-                            start = segment.get("start", 0)
+                        # Analyze each segment for pitch characteristics
+                        segment_features = []
+                        for segment in result["segments"]:
+                            start_sample = int(segment.get("start", 0) * sr)
+                            end_sample = int(segment.get("end", start_sample/sr + 1) * sr)
+                            segment_audio = audio_data[start_sample:end_sample]
                             
-                            # If there's a pause > 1 second, likely a speaker change
-                            if start - last_end > 1.0:
-                                current_speaker = "SPEAKER_01" if current_speaker == "SPEAKER_00" else "SPEAKER_00"
-                            
-                            segment["speaker"] = current_speaker
-                            last_end = segment.get("end", start)
+                            if len(segment_audio) > 0:
+                                # Extract pitch using librosa
+                                pitches, magnitudes = librosa.piptrack(
+                                    y=segment_audio, 
+                                    sr=sr,
+                                    fmin=50,  # Min frequency to detect
+                                    fmax=400  # Max frequency (covers child range)
+                                )
+                                
+                                # Get median pitch (more robust than mean)
+                                pitch_values = pitches[magnitudes > np.median(magnitudes)]
+                                median_pitch = np.median(pitch_values) if len(pitch_values) > 0 else 0
+                                
+                                # Calculate energy/loudness
+                                energy = np.mean(librosa.feature.rms(y=segment_audio))
+                                
+                                segment_features.append({
+                                    'pitch': median_pitch,
+                                    'energy': energy,
+                                    'duration': segment.get("end", 0) - segment.get("start", 0)
+                                })
+                            else:
+                                segment_features.append({'pitch': 0, 'energy': 0, 'duration': 0})
                         
-                        print("  • Assigned speakers based on turn-taking patterns")
+                        # Cluster segments into 2 groups (adult vs child) using simple k-means on pitch
+                        pitches = np.array([f['pitch'] for f in segment_features])
+                        valid_pitches = pitches[pitches > 0]
+                        
+                        if len(valid_pitches) > 2:
+                            # Simple 2-means: find median, assign based on above/below
+                            pitch_threshold = np.median(valid_pitches)
+                            
+                            # Assign speakers: higher pitch = likely child
+                            for i, (segment, features) in enumerate(zip(result["segments"], segment_features)):
+                                if features['pitch'] > pitch_threshold and features['pitch'] > 0:
+                                    segment["speaker"] = "SPEAKER_01"  # Higher pitch (child)
+                                elif features['pitch'] > 0:
+                                    segment["speaker"] = "SPEAKER_00"  # Lower pitch (adult)
+                                else:
+                                    # Fall back to turn-taking for segments without clear pitch
+                                    if i > 0:
+                                        segment["speaker"] = result["segments"][i-1].get("speaker", "SPEAKER_00")
+                                    else:
+                                        segment["speaker"] = "SPEAKER_00"
+                            
+                            print(f"  • Detected pitch threshold: {pitch_threshold:.1f} Hz")
+                            print(f"  • SPEAKER_00 (adult/lower pitch), SPEAKER_01 (child/higher pitch)")
+                        else:
+                            # Fallback to turn-taking if pitch detection fails
+                            print("  • Insufficient pitch data, using turn-taking fallback")
+                            current_speaker = "SPEAKER_00"
+                            last_end = 0
+                            for segment in result["segments"]:
+                                start = segment.get("start", 0)
+                                if start - last_end > 1.0:
+                                    current_speaker = "SPEAKER_01" if current_speaker == "SPEAKER_00" else "SPEAKER_00"
+                                segment["speaker"] = current_speaker
+                                last_end = segment.get("end", start)
                         
                     except Exception as e:
                         print(f"  • Simple diarization failed: {e}")
