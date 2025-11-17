@@ -20,10 +20,13 @@ import whisperx
 from presidio_analyzer import AnalyzerEngine
 from presidio_anonymizer import AnonymizerEngine
 from tqdm import tqdm
+from typing import Any, cast
 
 # Optional: used to detect platform (CUDA / MPS / CPU)
+# Use `# type: ignore` so type checkers/Pylance won't error if torch
+# isn't installed in the analysis environment.
 try:
-    import torch
+    import torch  # type: ignore
 except Exception:
     torch = None
 
@@ -137,6 +140,16 @@ def download_videos():
     print("="*60)
 
     os.makedirs(DOWNLOAD_DIR, exist_ok=True)
+    # If there are already video files in DOWNLOAD_DIR, skip downloading
+    existing_videos = list(Path(DOWNLOAD_DIR).rglob("*.mp4")) + \
+                      list(Path(DOWNLOAD_DIR).rglob("*.mov")) + \
+                      list(Path(DOWNLOAD_DIR).rglob("*.avi"))
+
+    force_download = os.environ.get("VOCAB_FORCE_DOWNLOAD", "0") == "1"
+    if existing_videos and not force_download:
+        print(f"Found {len(existing_videos)} existing video file(s) in {DOWNLOAD_DIR}; skipping download.")
+        print("Set environment variable VOCAB_FORCE_DOWNLOAD=1 to force re-download.")
+        return existing_videos
 
     try:
         print(f"Downloading folder: {GDRIVE_FOLDER_URL}")
@@ -160,6 +173,11 @@ def download_videos():
 
     except Exception as e:
         print(f"✗ Error downloading from Google Drive: {e}")
+        # If download failed but we have existing files, proceed with them
+        if existing_videos:
+            print(f"Using {len(existing_videos)} existing file(s) from {DOWNLOAD_DIR} despite download error.")
+            return existing_videos
+
         print("\nTroubleshooting:")
         print("1. Ensure folder is set to 'Anyone with the link'")
         print("2. Check folder ID is correct")
@@ -213,9 +231,23 @@ def transcribe_and_diarize(audio_files):
 
     os.makedirs(TRANSCRIPT_DIR, exist_ok=True)
 
-    # Load Whisper model once
+    # Determine device to pass to whisperx/faster-whisper.
+    # faster-whisper (used by whisperx) currently supports 'cuda' and 'cpu' only;
+    # it does not support Apple MPS. If running on MPS, fall back to CPU for whisperx
+    # but keep DEVICE as 'mps' for other torch-based operations.
+    whisper_device = DEVICE if DEVICE == "cuda" else "cpu"
+    if DEVICE == "mps":
+        print("Note: running on Apple MPS. whisperx/faster-whisper does not support MPS, falling back to CPU for model inference.")
+
+    # Determine a compute type compatible with whisperx/faster-whisper
+    whisper_compute_type = COMPUTE_TYPE
+    if whisper_device != "cuda" and str(whisper_compute_type).lower() == "float16":
+        print("Warning: float16 compute requested but target device/backend does not support efficient float16. Falling back to int8 for whisperx.")
+        whisper_compute_type = "int8"
+
+    # Load Whisper model once (use whisper_device for whisperx compatibility)
     print("Loading Whisper model...")
-    model = whisperx.load_model(WHISPER_MODEL, DEVICE, compute_type=COMPUTE_TYPE)
+    model = whisperx.load_model(WHISPER_MODEL, whisper_device, compute_type=whisper_compute_type)
 
     transcripts = []
 
@@ -231,22 +263,24 @@ def transcribe_and_diarize(audio_files):
 
             # Align for better word-level timestamps
             model_a, metadata = whisperx.load_align_model(
-                language_code=result["language"], 
-                device=DEVICE
+                language_code=result["language"],
+                device=whisper_device
             )
             result = whisperx.align(
-                result["segments"], 
-                model_a, 
-                metadata, 
-                audio, 
-                DEVICE,
+                result["segments"],
+                model_a,
+                metadata,
+                audio,
+                whisper_device,
                 return_char_alignments=False
             )
 
             # Diarization (speaker identification)
-            diarize_model = whisperx.DiarizationPipeline(
+            # DiarizationPipeline may not be present in some whisperx stubs; silence
+            # static attribute warnings while preserving runtime behavior.
+            diarize_model = whisperx.DiarizationPipeline(  # type: ignore[attr-defined]
                 use_auth_token=None,  # Set Hugging Face token if needed
-                device=DEVICE
+                device=whisper_device
             )
             diarize_segments = diarize_model(
                 str(audio_path),
@@ -257,6 +291,20 @@ def transcribe_and_diarize(audio_files):
 
             # Format transcript with speaker labels
             transcript_text = format_transcript(result["segments"])
+
+            # Save raw (pre-anonymized) transcript to disk for inspection/debugging
+            try:
+                raw_output_file = Path(TRANSCRIPT_DIR) / f"{base_name}_raw.txt"
+                with open(raw_output_file, "w", encoding="utf-8") as rf:
+                    rf.write("="*60 + "\n")
+                    rf.write(f"File: {base_name}\n")
+                    rf.write(f"Language: {result.get('language', 'unknown')}\n")
+                    rf.write("="*60 + "\n\n")
+                    rf.write(transcript_text)
+                    rf.write("\n\n" + "="*60 + "\n")
+                print(f"  • Saved raw transcript: {raw_output_file}")
+            except Exception as e:
+                print(f"\n✗ Failed to save raw transcript for {base_name}: {e}")
 
             transcripts.append({
                 "file": base_name,
@@ -329,9 +377,11 @@ def anonymize_transcripts(transcripts):
             )
 
             # Anonymize (replace with generic labels)
+            # Cast analyzer results to Any to avoid narrow type mismatch between
+            # presidio_analyzer and presidio_anonymizer types in static analysis.
             anonymized_result = anonymizer.anonymize(
                 text=original_text,
-                analyzer_results=analysis_results
+                analyzer_results=cast(Any, analysis_results)
             )
 
             # Save anonymized transcript
