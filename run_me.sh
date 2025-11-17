@@ -1,0 +1,1 @@
+chmod +x scripts/run_fast.sh && VOCAB_ONLY_BASENAME=lesson_assessment_ALI74 scripts/run_fast.sh

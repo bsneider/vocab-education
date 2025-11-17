@@ -1,0 +1,1 @@
+chmod +x scripts/run_diar.sh && VOCAB_ONLY_SMALLEST=1 VOCAB_FORCE_NUM_SPEAKERS=2 scripts/run_diar.sh example_lesson_ALI74

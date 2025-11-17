@@ -214,3 +214,9 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+downloaded_videos/example_lesson_ALI74.mp4
+downloaded_videos/lesson_assessment_ALI74.mp4
+downloaded_videos/supporting_papers/Olson_OzernovPalchik_Oct2025preprint.pdf
+downloaded_videos/supporting_papers/Ozernov-Palchik_Olson_2022.pdf
+extracted_audio/example_lesson_ALI74.wav
+extracted_audio/lesson_assessment_ALI74.wav

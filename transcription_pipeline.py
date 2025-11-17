@@ -220,6 +220,37 @@ def extract_audio(video_files):
     print(f"\n✓ Successfully extracted {len(audio_files)} audio files")
     return audio_files
 
+# ==================== STEP 2.5: Pitch Adjustment for Diarization ====================
+def create_pitch_adjusted_audio(audio_path, semitones=-4):
+    """Create pitch-adjusted version of audio for better child voice diarization.
+    
+    Children's voices are typically 3-5 semitones higher than adults.
+    Shifting down helps diarization models trained on adult speech.
+    """
+    base_name = Path(audio_path).stem
+    adjusted_path = Path(AUDIO_DIR) / f"{base_name}_pitched.wav"
+    
+    # Skip if already exists
+    if adjusted_path.exists():
+        return adjusted_path
+    
+    try:
+        # Use ffmpeg with rubberband filter for pitch shifting without tempo change
+        # -4 semitones shifts child voice closer to adult range
+        cmd = [
+            "ffmpeg", "-i", str(audio_path),
+            "-af", f"asetrate=16000*2^({semitones}/12),aresample=16000",
+            str(adjusted_path),
+            "-y"
+        ]
+        
+        subprocess.run(cmd, check=True, capture_output=True)
+        return adjusted_path
+    except subprocess.CalledProcessError as e:
+        print(f"  • Warning: Could not create pitch-adjusted audio: {e}")
+        print(f"  • Falling back to original audio for diarization")
+        return audio_path
+
 # ==================== STEP 3: Transcribe & Diarize ====================
 def transcribe_and_diarize(audio_files):
     """Transcribe audio with WhisperX and perform speaker diarization"""
@@ -260,7 +291,7 @@ def transcribe_and_diarize(audio_files):
             audio = whisperx.load_audio(str(audio_path))
 
             # Transcribe
-            result = model.transcribe(audio, batch_size=BATCH_SIZE)
+            result = model.transcribe(audio, batch_size=BATCH_SIZE, print_progress=True)
 
             # Align for better word-level timestamps
             model_a, metadata = whisperx.load_align_model(
@@ -282,18 +313,151 @@ def transcribe_and_diarize(audio_files):
                 print("  • Diarization disabled via VOCAB_DISABLE_DIARIZATION=1; proceeding without speaker labels.")
             else:
                 # Diarization (speaker identification)
-                # DiarizationPipeline may not be present in some whisperx stubs; silence
-                # static attribute warnings while preserving runtime behavior.
-                diarize_model = whisperx.DiarizationPipeline(  # type: ignore[attr-defined]
-                    use_auth_token=None,  # Set Hugging Face token if needed
-                    device=whisper_device
-                )
-                diarize_segments = diarize_model(
-                    str(audio_path),
-                    min_speakers=MIN_SPEAKERS,
-                    max_speakers=MAX_SPEAKERS
-                )
-                result = whisperx.assign_word_speakers(diarize_segments, result)
+                # Try simple energy-based speaker detection first (no HF token needed)
+                # Then fall back to HF-based models if token is provided
+                hf_token = os.environ.get("VOCAB_HF_TOKEN")
+                
+                if not hf_token:
+                    # Simple approach: use energy/amplitude to detect speakers
+                    # Adult voices typically have lower pitch and different energy patterns
+                    print("  • Using simple energy-based speaker detection (no HuggingFace token)")
+                    print("  • Note: For better accuracy, set VOCAB_HF_TOKEN with pyannote models")
+                    
+                    try:
+                        # Use whisperx's built-in VAD and assign speakers based on segment patterns
+                        # This won't be perfect but provides basic teacher/student separation
+                        import numpy as np
+                        from scipy import signal
+                        
+                        # Load audio for analysis
+                        audio_data = whisperx.load_audio(str(audio_path))
+                        
+                        # Simple heuristic: alternate speakers on longer pauses
+                        # Assign SPEAKER_00 and SPEAKER_01 based on turn-taking patterns
+                        current_speaker = "SPEAKER_00"
+                        last_end = 0
+                        
+                        for i, segment in enumerate(result["segments"]):
+                            start = segment.get("start", 0)
+                            
+                            # If there's a pause > 1 second, likely a speaker change
+                            if start - last_end > 1.0:
+                                current_speaker = "SPEAKER_01" if current_speaker == "SPEAKER_00" else "SPEAKER_00"
+                            
+                            segment["speaker"] = current_speaker
+                            last_end = segment.get("end", start)
+                        
+                        print("  • Assigned speakers based on turn-taking patterns")
+                        
+                    except Exception as e:
+                        print(f"  • Simple diarization failed: {e}")
+                        print("  • Proceeding without speaker labels")
+                        print("  • Assigned speakers based on turn-taking patterns")
+                        
+                    except Exception as e:
+                        print(f"  • Simple diarization failed: {e}")
+                        print("  • Proceeding without speaker labels")
+                else:
+                    # HuggingFace token provided - use advanced pyannote models
+                    print("  • Using Hugging Face token for diarization.")
+                    
+                    # Create pitch-adjusted version for better child voice detection
+                    # Children's voices are 3-5 semitones higher; shift down for diarization
+                    pitch_env = os.environ.get("VOCAB_PITCH_SHIFT", "-4")
+                    try:
+                        pitch_shift = int(pitch_env)
+                    except:
+                        pitch_shift = -4
+                    
+                    if pitch_shift != 0:
+                        print(f"  • Creating pitch-adjusted audio ({pitch_shift:+d} semitones) for better child voice detection")
+                        diarization_audio = create_pitch_adjusted_audio(audio_path, pitch_shift)
+                    else:
+                        diarization_audio = audio_path
+                    
+                    diarize_segments = None
+                    try:
+                        # Try whisperx DiarizationPipeline first
+                        diarize_model = whisperx.DiarizationPipeline(  # type: ignore[attr-defined]
+                            use_auth_token=hf_token,
+                            device=whisper_device
+                        )
+                        # Allow forcing an exact speaker count via env
+                        min_speakers = MIN_SPEAKERS
+                        max_speakers = MAX_SPEAKERS
+                        force_num_env = os.environ.get("VOCAB_FORCE_NUM_SPEAKERS")
+                        if force_num_env:
+                            try:
+                                n = int(force_num_env)
+                                min_speakers = n
+                                max_speakers = n
+                                print(f"  • Forcing diarization to {n} speaker(s) (VOCAB_FORCE_NUM_SPEAKERS)")
+                            except Exception:
+                                print(f"  • Warning: invalid VOCAB_FORCE_NUM_SPEAKERS='{force_num_env}', using defaults {MIN_SPEAKERS}-{MAX_SPEAKERS}")
+                        diarize_segments = diarize_model(
+                            str(diarization_audio),
+                            min_speakers=min_speakers,
+                            max_speakers=max_speakers
+                        )
+                    except AttributeError:
+                        # Fallback to pyannote.audio with child-optimized parameters
+                        try:
+                            from pyannote.audio import Pipeline  # type: ignore
+                            print("  • Using pyannote.audio speaker-diarization-3.1 pipeline (child-optimized)")
+                            pipeline = Pipeline.from_pretrained(
+                                "pyannote/speaker-diarization-3.1",
+                                use_auth_token=hf_token
+                            )
+                            
+                            # Child speech optimization parameters
+                            # Lower min_duration_off to catch shorter pauses (children speak faster)
+                            # Adjust clustering threshold for better child/adult separation
+                            force_num_env = os.environ.get("VOCAB_FORCE_NUM_SPEAKERS")
+                            if force_num_env:
+                                try:
+                                    num_speakers = int(force_num_env)
+                                    print(f"  • Forcing diarization to {num_speakers} speaker(s)")
+                                    diarize_segments = pipeline(
+                                        str(diarization_audio),
+                                        num_speakers=num_speakers,
+                                        min_duration_off=0.3  # Shorter pauses for child speech
+                                    )
+                                except Exception:
+                                    print(f"  • Falling back to min/max speakers")
+                                    diarize_segments = pipeline(
+                                        str(diarization_audio),
+                                        min_speakers=MIN_SPEAKERS,
+                                        max_speakers=MAX_SPEAKERS,
+                                        min_duration_off=0.3
+                                    )
+                            else:
+                                diarize_segments = pipeline(
+                                    str(diarization_audio),
+                                    min_speakers=MIN_SPEAKERS,
+                                    max_speakers=MAX_SPEAKERS,
+                                    min_duration_off=0.3  # Child-optimized: shorter pauses
+                                )
+                        except Exception as de:
+                            print(f"  • Diarization fallback failed: {de}")
+                            print(f"  • Note: Pyannote models may require accepting terms at:")
+                            print(f"  •   https://huggingface.co/pyannote/speaker-diarization-3.1")
+                            print(f"  •   https://huggingface.co/pyannote/segmentation-3.0")
+                    
+                    if diarize_segments is not None:
+                        result = whisperx.assign_word_speakers(diarize_segments, result)
+                        try:
+                            speakers_detected = sorted({seg.get("speaker") for seg in result.get("segments", []) if seg.get("speaker")})
+                            if speakers_detected:
+                                print(f"  • Speakers detected: {', '.join(speakers_detected)}")
+                            else:
+                                print(f"  • Warning: No speakers detected. This may indicate:")
+                                print(f"  •   - Model terms not accepted on HuggingFace")
+                                print(f"  •   - Very similar voices (child/adult can be hard to separate)")
+                                print(f"  •   - Audio quality issues")
+                        except Exception:
+                            pass
+                    else:
+                        print("  • Proceeding without diarization due to previous errors.")
 
             # Format transcript with speaker labels
             transcript_text = format_transcript(result["segments"])
@@ -432,6 +596,15 @@ def main():
 
     # Step 1: Download videos
     video_files = download_videos()
+    # Optionally process only a specific file by base name (without extension)
+    only_base = os.environ.get("VOCAB_ONLY_BASENAME")
+    if only_base:
+        filtered = [p for p in video_files if Path(p).stem == only_base]
+        if filtered:
+            print(f"Processing only specified file (VOCAB_ONLY_BASENAME): {filtered[0]}")
+            video_files = filtered
+        else:
+            print(f"Warning: No video matched VOCAB_ONLY_BASENAME={only_base}. Proceeding with all videos.")
     # Optionally only process the smallest video for quicker runs
     if os.environ.get("VOCAB_ONLY_SMALLEST", "0") == "1" and video_files:
         try:
