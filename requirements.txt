@@ -32,7 +32,7 @@ en_core_web_lg @ https://github.com/explosion/spacy-models/releases/download/en_
 faster-whisper==1.2.1
 filelock==3.20.0
 flatbuffers==25.9.23
-fonttools==4.60.1
+fonttools==4.61.0
 frozenlist==1.8.0
 fsspec==2025.10.0
 gdown==5.2.0
